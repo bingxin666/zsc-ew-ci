@@ -97,15 +97,15 @@ gh run list -R bingxin666/zsc-ew-ci --limit 5
 gh run watch -R bingxin666/zsc-ew-ci
 ```
 
-### 自动触发
+### 没有自动触发
 
-| 触发 | 条件 |
-|---|---|
-| `push` | 本仓库 `deploy/**` 或 `.github/workflows/**` 有改动 |
-| `schedule` | 每周一 04:00 UTC |
+**只有手动 `workflow_dispatch`，没有 push / schedule 自动触发。**
 
-**注意：上游 GitLab 有新提交不会自动触发。** GitHub 无法轮询外部仓库，
-需要手动 `workflow_dispatch`，或者用别的方式（见下）。
+原因：镜像约 2.5GB，一次构建要拉 222MB deb + docker build + 推 2.5GB，
+很耗 Actions 额度和带宽；定时触发还会在没人看的时候白跑。
+
+代价是本仓库自己的改动（`deploy/Dockerfile` 等）也不会自动验证，改完记得
+手动跑一次。上游 GitLab 有新提交同样不会触发。
 
 ### 产出的 tag
 
@@ -153,7 +153,7 @@ cp deploy/Dockerfile deploy/entrypoint.sh deploy/zscwd.env.example ../zsc-ew-ci/
 cd ../zsc-ew-ci && git add -A && git commit -m "sync build files from upstream" && git push
 ```
 
-改动会触发一次自动构建。
+改完后手动跑一次 workflow 验证。
 
 ## 构建耗时参考
 

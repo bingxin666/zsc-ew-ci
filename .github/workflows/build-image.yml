@@ -10,8 +10,12 @@ name: build-image
 # 源码不在这个仓库：构建时从 GitLab clone（含 Git LFS 的 222MB 微信 deb）。
 # 触发方式见下方 on:。
 
+# 只允许手动触发。
+#
+# 不配 push / schedule 的原因：镜像约 2.5GB，一次构建包含从 GitLab 拉
+# 222MB 的 deb + docker build + 推送 2.5GB，很耗 Actions 额度和带宽。
+# 定时触发还会在没人看的时候白跑。需要新镜像时手动 dispatch 即可。
 on:
-  # 手动触发，可以指定 GitLab 的 ref
   workflow_dispatch:
     inputs:
       source_ref:
@@ -22,17 +26,6 @@ on:
         description: '额外的镜像 tag（留空则只用 commit sha 和 latest）'
         required: false
         default: ''
-
-  # 定时检查上游有没有新提交，有就重建
-  schedule:
-    - cron: '0 4 * * 1'   # 每周一 04:00 UTC
-
-  # 这个仓库自己改动时也跑一次（改 Dockerfile / workflow 时验证）
-  push:
-    branches: [main]
-    paths:
-      - 'deploy/**'
-      - '.github/workflows/**'
 
 env:
   REGISTRY: ghcr.io

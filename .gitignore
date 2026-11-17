@@ -1,0 +1,12 @@
+# 构建产物不进库
+/buildctx/
+source/
+
+# 二进制和 deb 由 CI 现场生成/拉取，不要提交
+deploy/bin/
+deploy/*.deb
+
+# 编辑器
+.vscode/
+.idea/
+*.swp

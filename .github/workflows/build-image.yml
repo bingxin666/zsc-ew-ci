@@ -1,0 +1,202 @@
+name: build-image
+
+# 只做一件事：从 GitLab 拉源码 → 编译 → 构建镜像 → 推 ghcr.io
+#
+# 为什么单独开这个仓库：
+#   GitLab 实例的 Runner 没有 privileged，docker:dind 起不来；buildah 也被
+#   unshare(CLONE_NEWUSER) 拒绝。GitHub 的 ubuntu-latest runner 原生带
+#   docker，直接可用。
+#
+# 源码不在这个仓库：构建时从 GitLab clone（含 Git LFS 的 222MB 微信 deb）。
+# 触发方式见下方 on:。
+
+on:
+  # 手动触发，可以指定 GitLab 的 ref
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'GitLab 源码的 ref（branch / tag / commit）'
+        required: true
+        default: 'main'
+      image_tag:
+        description: '额外的镜像 tag（留空则只用 commit sha 和 latest）'
+        required: false
+        default: ''
+
+  # 定时检查上游有没有新提交，有就重建
+  schedule:
+    - cron: '0 4 * * 1'   # 每周一 04:00 UTC
+
+  # 这个仓库自己改动时也跑一次（改 Dockerfile / workflow 时验证）
+  push:
+    branches: [main]
+    paths:
+      - 'deploy/**'
+      - '.github/workflows/**'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  # 上游源码位置
+  UPSTREAM_HOST: git.haori.ink
+  UPSTREAM_REPO: bingxin/zsc-water-and-electricity
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write        # 推 ghcr 必需
+      attestations: write    # 生成 provenance
+      id-token: write        # attestation 需要
+
+    steps:
+      - name: Checkout this repo (Dockerfile / entrypoint)
+        uses: actions/checkout@v4
+
+      # ── 拉上游源码 ────────────────────────────────────────────
+      #
+      # 上游是 GitLab 私有仓库，GITHUB_TOKEN 只对当前仓库有效，必须用
+      # 单独的凭据。用 GitLab Personal Access Token（read_repository 即可）。
+      #
+      # 配法：GitHub 仓库 Settings → Secrets and variables → Actions
+      #       新增 secret：GITLAB_TOKEN = <GitLab PAT>
+      #     可选：GITLAB_USER = <GitLab 用户名>（默认 bingxin）
+      - name: Clone upstream source from GitLab
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+          # secret 未设置时为空字符串，脚本里回退到默认用户名
+          GITLAB_USER_SECRET: ${{ secrets.GITLAB_USER }}
+          REF: ${{ inputs.source_ref || 'main' }}
+        run: |
+          set -euo pipefail
+          GITLAB_USER="${GITLAB_USER_SECRET:-bingxin}"
+          if [ -z "${GITLAB_TOKEN:-}" ]; then
+            echo "::error::缺少 GITLAB_TOKEN secret"
+            echo "去 GitLab 建一个 read_repository 权限的 PAT，存到本仓库的 secret"
+            exit 1
+          fi
+
+          git lfs install
+          # 只取目标 ref 的最后一个 commit，避免拉全量历史
+          git clone --depth 1 --branch "$REF" \
+            "https://${GITLAB_USER}:${GITLAB_TOKEN}@${UPSTREAM_HOST}/${UPSTREAM_REPO}.git" \
+            source
+
+          cd source
+          git lfs pull --include="deploy/*.deb"
+
+          DEB=$(ls deploy/*.deb | head -1)
+          SIZE=$(stat -c %s "$DEB")
+          echo "deb: $DEB ($SIZE bytes)"
+          # 防止拿到 LFS pointer（几百字节）就打镜像
+          if [ "$SIZE" -lt 1000000 ]; then
+            echo "::error::$DEB 只有 $SIZE 字节，是 LFS pointer 不是真文件"
+            head -3 "$DEB"
+            exit 1
+          fi
+          echo "SOURCE_SHA=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+
+      # ── 编译 Go 二进制 ────────────────────────────────────────
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: source/go.mod
+          cache-dependency-path: source/go.sum
+
+      - name: Build binaries
+        working-directory: source
+        env:
+          CGO_ENABLED: '0'
+        run: |
+          set -euo pipefail
+          VERSION="${SOURCE_SHA}"
+          mkdir -p deploy/bin
+          go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
+            -o deploy/bin/zscwd ./cmd/zscwd/
+          go build -trimpath -ldflags "-s -w" -o deploy/bin/zsctool ./cmd/zsctool/
+          go build -trimpath -ldflags "-s -w" -o deploy/bin/hookprobe ./cmd/hookprobe/
+          ls -lh deploy/bin/
+
+      # ── 组装构建上下文 ────────────────────────────────────────
+      #
+      # Dockerfile 的 COPY 期望这些都在同一目录：
+      #   wechat_*.deb / bin/{zscwd,zsctool,hookprobe} / entrypoint.sh / zscwd.env.example
+      # 二进制来自上游编译，Dockerfile 和 entrypoint 用本仓库的版本（这样
+      # 改构建逻辑不用动上游代码）。
+      - name: Assemble build context
+        run: |
+          set -euo pipefail
+          mkdir -p buildctx
+          cp source/deploy/*.deb          buildctx/
+          cp -r source/deploy/bin         buildctx/bin
+          cp deploy/Dockerfile            buildctx/Dockerfile
+          cp deploy/entrypoint.sh         buildctx/entrypoint.sh
+          cp deploy/zscwd.env.example     buildctx/zscwd.env.example
+          ls -lh buildctx/ buildctx/bin/
+
+      # ── 构建并推送 ────────────────────────────────────────────
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ inputs.image_tag }},enable=${{ inputs.image_tag != '' && inputs.image_tag != null }}
+            type=raw,value=src-${{ env.SOURCE_SHA }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: buildctx
+          file: buildctx/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # 微信镜像本体约 2.5GB，构建缓存对二次构建帮助很大
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            WECHAT_VERSION=4.1.13.26
+
+      - name: Attest provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Summary
+        run: |
+          {
+            echo "## 构建完成"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 上游 commit | \`${SOURCE_SHA}\` |"
+            echo "| 镜像 digest | \`${{ steps.build.outputs.digest }}\` |"
+            echo "| 大小 | $(docker image inspect ${{ steps.meta.outputs.tags }} --format '{{.Size}}' 2>/dev/null || echo 'n/a') |"
+            echo ""
+            echo "### tags"
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+            echo ""
+            echo "### 拉取并运行"
+            echo '```bash'
+            echo "docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -40,8 +40,10 @@ jobs:
     permissions:
       contents: read
       packages: write        # 推 ghcr 必需
-      attestations: write    # 生成 provenance
-      id-token: write        # attestation 需要
+      # 不声明 attestations / id-token：
+      #   attest-build-provenance 对「用户拥有的私有仓库」不可用，会报
+      #   Feature not available for user-owned private repositories。
+      #   它只是可选的溯源签名，不影响镜像本身，去掉即可。
 
     steps:
       - name: Checkout this repo (Dockerfile / entrypoint)
@@ -210,13 +212,6 @@ jobs:
           cache-to: type=gha,mode=max
           build-args: |
             WECHAT_VERSION=4.1.13.26
-
-      - name: Attest provenance
-        uses: actions/attest-build-provenance@v2
-        with:
-          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          subject-digest: ${{ steps.build.outputs.digest }}
-          push-to-registry: true
 
       - name: Summary
         run: |

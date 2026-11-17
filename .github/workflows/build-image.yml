@@ -70,25 +70,71 @@ jobs:
             exit 1
           fi
 
-          git lfs install
-          # 只取目标 ref 的最后一个 commit，避免拉全量历史
-          git clone --depth 1 --branch "$REF" \
-            "https://${GITLAB_USER}:${GITLAB_TOKEN}@${UPSTREAM_HOST}/${UPSTREAM_REPO}.git" \
-            source
+          REPO_URL="https://${GITLAB_USER}:${GITLAB_TOKEN}@${UPSTREAM_HOST}/${UPSTREAM_REPO}.git"
+
+          # LFS smudge 全程跳过，clone 阶段只拿 pointer。
+          #
+          # 踩过的坑：先 `git lfs install` 再 clone，会让 clone 顺带拉 222MB
+          # 的 deb，跨境链路直接在 clone 阶段断掉：
+          #   error: RPC failed; curl 92 HTTP/2 stream 7 was not closed cleanly
+          #   fatal: early EOF / invalid index-pack output
+          # 分两步走：clone 只取元数据（很快），LFS 单独拉并带重试。
+          export GIT_LFS_SKIP_SMUDGE=1
+
+          # 跨境拉大文件容易触发 HTTP/2 RPC 中断，用这几个设置缓解：
+          #   http.version HTTP/1.1  —— HTTP/2 的 multiplexing 在不稳定链路上
+          #                             更容易整体失败，降级到 1.1 更稳
+          #   postBuffer 大        —— 避免大对象传输被缓冲限制打断
+          #   lfs.activitytimeout  —— 长时间无数据也不主动断开
+          #   lfs.concurrenttransfers 1 —— 单线程传，减少并发导致的连接问题
+          git config --global http.version HTTP/1.1
+          git config --global http.postBuffer 524288000
+          git config --global http.lowSpeedLimit 0
+          git config --global http.lowSpeedTime 999999
+          git config --global lfs.activitytimeout 600
+          git config --global lfs.concurrenttransfers 1
+
+          echo "cloning $UPSTREAM_HOST/$UPSTREAM_REPO @ $REF"
+          for attempt in 1 2 3; do
+            rm -rf source
+            if git clone --depth 1 --branch "$REF" "$REPO_URL" source; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::clone 失败 3 次，检查 GitLab 可达性或 token 权限"
+              exit 1
+            fi
+            echo "clone 第 $attempt 次失败，${attempt}0 秒后重试"
+            sleep $((attempt * 10))
+          done
 
           cd source
-          git lfs pull --include="deploy/*.deb"
-
-          DEB=$(ls deploy/*.deb | head -1)
-          SIZE=$(stat -c %s "$DEB")
-          echo "deb: $DEB ($SIZE bytes)"
-          # 防止拿到 LFS pointer（几百字节）就打镜像
-          if [ "$SIZE" -lt 1000000 ]; then
-            echo "::error::$DEB 只有 $SIZE 字节，是 LFS pointer 不是真文件"
-            head -3 "$DEB"
-            exit 1
-          fi
           echo "SOURCE_SHA=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          echo "上游 commit: $(git rev-parse --short HEAD) ($(git log -1 --format=%s))"
+
+          # LFS 拉 deb。单独一步，带重试和限速——222MB 跨境直连很容易断。
+          echo "pulling LFS objects (deploy/*.deb)"
+          for attempt in 1 2 3 4; do
+            if git lfs pull --include="deploy/*.deb"; then
+              DEB=$(ls deploy/*.deb 2>/dev/null | head -1 || true)
+              if [ -n "$DEB" ]; then
+                SIZE=$(stat -c %s "$DEB")
+                # 确认不是 pointer（几百字节）
+                if [ "$SIZE" -ge 1000000 ]; then
+                  echo "deb OK: $DEB ($SIZE bytes)"
+                  break
+                fi
+              fi
+            fi
+            if [ "$attempt" -eq 4 ]; then
+              echo "::error::LFS 拉取失败 4 次，deb 可能只有 pointer"
+              head -3 deploy/*.deb 2>/dev/null || true
+              exit 1
+            fi
+            echo "LFS 第 $attempt 次失败，$((attempt * 20)) 秒后重试"
+            sleep $((attempt * 20))
+          done
+          echo "deb size: $SIZE bytes"
 
       # ── 编译 Go 二进制 ────────────────────────────────────────
       - name: Set up Go

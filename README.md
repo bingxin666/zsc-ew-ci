@@ -166,6 +166,54 @@ cd ../zsc-ew-ci && git add -A && git commit -m "sync build files from upstream" 
 
 首次构建没有缓存，会慢一些（docker build 那步要装微信依赖，约 5~8 min）。
 
+## 实测耗时（首次有缓存）
+
+第一次真实构建：clone + LFS 约 **520 秒**，docker build 约 **160 秒**。
+主要是 222MB deb 的跨境传输慢（约 0.4~0.5 MB/s）。后续构建有 gha 缓存，
+docker build 会快些，但 LFS 每次都要重拉（GitHub Actions 之间不共享工作区）。
+
+## 踩过的坑
+
+### 1. clone 阶段直接失败（RPC failed / early EOF）
+
+```
+git lfs install          ← 这一行在 clone 之前
+git clone --depth 1 ...
+```
+
+`git lfs install` 会让后续 clone 顺带拉 LFS 对象，于是 clone 阶段就要传
+222MB，跨境链路直接断：
+
+```
+error: RPC failed; curl 92 HTTP/2 stream 7 was not closed cleanly
+error: 49947 bytes of body are still expected
+fatal: early EOF
+fatal: fetch-pack: invalid index-pack output
+```
+
+**修法**：clone 前 `export GIT_LFS_SKIP_SMUDGE=1`，clone 只拿 pointer
+（几秒完成），再单独 `git lfs pull` 并重试。
+
+### 2. attestation 步骤失败
+
+```
+Error: Failed to persist attestation:
+Feature not available for user-owned private repositories.
+```
+
+GitHub 的 `attest-build-provenance` 只对公开仓库或**组织**拥有的私有仓库
+可用。用户私有仓库用不了。它只是可选的 SLSA 溯源签名，不影响镜像，
+已从 workflow 里移除。
+
+### 3. 本地 `gh` 查不到 package
+
+```
+gh: You need at least read:packages scope to get a package's versions.
+```
+
+本地 `gh` token 只有 `repo` / `workflow` 等 scope。想用 API 查包信息需要
+额外加 `read:packages`。不影响 CI 推送（CI 用内置 GITHUB_TOKEN）。
+
 ## 已知限制
 
 - **上游更新不自动触发**：需要手动 dispatch，或在本仓库加个定时任务探测
